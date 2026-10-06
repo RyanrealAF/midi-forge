@@ -1,104 +1,116 @@
-"""Pipeline orchestrator: separate → analyze → transcribe → verify → retry."""
-import gc
+"""Pipeline: prep → separate (2-pass) → clean → transcribe (per-stem) → verify."""
 import os
 import shutil
+import zipfile
 from pathlib import Path
 
-from .separate import separate_stems, STEMS
-from .analyze import analyze_stem
-from .transcribe import transcribe_stem
-from .verify import verify_midi
-
-THRESHOLD = 0.65
-MAX_ATTEMPTS = 3
+from .prep import prep_source
+from .separate import separate_two_pass, STEMS
+from .clean import clean_stem
+from .transcribe import transcribe_drums, transcribe_mono, transcribe_poly
+from .verify import verify_midi, check_clean_midi
 
 
-def run_pipeline(audio_path: str, work_dir: str, on_stage=None) -> dict:
+def detect_bpm(wav_path: str) -> float:
+    """Detect BPM from audio."""
+    import librosa
+    y, sr = librosa.load(wav_path, sr=22050, mono=True)
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    return round(float(tempo), 1)
+
+
+def run_pipeline(input_path: str, work_dir: str, on_stage=None,
+                 skip_vocals_midi: bool = True) -> dict:
     """
-    Full pipeline. Returns:
-    {
-        "track": str,
-        "midi": {stem: path},
-        "analysis": {stem: dict},
-        "verification": {stem: dict},
-        "report": path,
-        "zip": path,
-    }
+    Full offline pipeline.
+    Returns {track, bpm, midi: {stem: path}, verification: {stem: dict},
+             issues: {stem: [str]}, zip, all_stems_mid}.
     """
-    import torch
+    stage = on_stage or (lambda s: print(f"  {s}"))
+    track = Path(input_path).stem
 
-    track = Path(audio_path).stem
-    stage = on_stage or (lambda s: None)
+    # 1. Prep
+    stage("Prepping source (normalize, convert to WAV)…")
+    prepped = prep_source(input_path, work_dir)
+    bpm = detect_bpm(prepped)
+    stage(f"Detected BPM: {bpm}")
 
-    # 1. Separate
-    stem_paths = separate_stems(audio_path, os.path.join(work_dir, "stems"), stage)
+    # 2. Two-pass separation
+    stems = separate_two_pass(prepped, os.path.join(work_dir, "stems"), stage)
 
-    # 2. Load transcription model once
-    stage("Loading transcription model…")
-    from basic_pitch.inference import Model
-    from basic_pitch import ICASSP_2022_MODEL_PATH
-    model = Model(ICASSP_2022_MODEL_PATH)
-
-    # 3. Per-stem: analyze → transcribe → verify → retry
+    # 3. Clean + 4. Transcribe per stem
     midi_dir = os.path.join(work_dir, "midi")
     os.makedirs(midi_dir, exist_ok=True)
 
-    midi, analysis, verification = {}, {}, {}
+    midi_paths, verifications, all_issues = {}, {}, {}
+
     for stem in STEMS:
-        stage(f"Analyzing {stem}…")
-        analysis[stem] = analyze_stem(stem_paths[stem])
+        if stem == "vocals" and skip_vocals_midi:
+            stage("Skipping vocals MIDI (muted per workflow)…")
+            continue
 
-        best_path, best_v, best_score = None, None, -1
-        for attempt in range(MAX_ATTEMPTS):
-            stage(f"Transcribing {stem} (attempt {attempt + 1})…")
-            tmp = os.path.join(midi_dir, f"{stem}_a{attempt}.mid")
-            transcribe_stem(stem, stem_paths[stem], tmp, model,
-                            analysis[stem], attempt)
+        stage(f"Cleaning {stem}…")
+        cleaned = clean_stem(stem, stems[stem],
+                             os.path.join(work_dir, "cleaned"))
 
-            stage(f"Verifying {stem}…")
-            v = verify_midi(tmp, stem_paths[stem])
-            if v["score"] > best_score:
-                best_score, best_path, best_v = v["score"], tmp, v
-            if v["score"] >= THRESHOLD:
-                break
+        stage(f"Transcribing {stem}…")
+        midi_out = os.path.join(midi_dir, f"{stem}.mid")
 
-        final = os.path.join(midi_dir, f"{stem}.mid")
-        shutil.copy(best_path, final)
-        midi[stem] = final
-        verification[stem] = best_v
+        if stem == "drums":
+            transcribe_drums(cleaned, midi_out)
+        elif stem == "bass":
+            transcribe_mono(cleaned, midi_out, fmin=30, fmax=300)
+        elif stem == "vocals":
+            transcribe_mono(cleaned, midi_out, fmin=80, fmax=1100)
+        else:  # other
+            transcribe_poly(cleaned, midi_out, sensitivity=0.72)
 
-    # 4. Cleanup
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        # 5. Verify
+        stage(f"Verifying {stem}…")
+        verifications[stem] = verify_midi(midi_out, cleaned)
 
-    # 5. Report
-    stage("Writing verification report…")
-    lines = [f"# MIDI Forge — Verification Report: {track}", ""]
-    for stem in STEMS:
-        a, v = analysis[stem], verification[stem]
-        ok = "✓ PASS" if v["score"] >= THRESHOLD else "⚠ REVIEW"
-        lines += [
-            f"## {stem} — {ok}",
-            f"- Score: **{v['score']}** ({v['detail']})",
-            f"- BPM: {a['bpm']} | Key: {a['key']} | Energy: {a['energy_db']} dB",
-            f"- Pitch: {a['pitch_min_hz']}–{a['pitch_max_hz']} Hz | "
-            f"Onsets/s: {a['onset_density']}",
-            "",
-        ]
-    report_path = os.path.join(work_dir, "verification_report.md")
-    Path(report_path).write_text("\n".join(lines))
+        # 6. Clean MIDI checklist
+        issues = check_clean_midi(midi_out, stem)
+        all_issues[stem] = issues
+        if issues:
+            stage(f"  ⚠ {stem}: {'; '.join(issues)}")
 
-    # 6. ZIP
-    import zipfile
+        midi_paths[stem] = midi_out
+
+    # 7. All-stems MIDI (merge)
+    stage("Merging all-stems MIDI…")
+    import pretty_midi
+    combined = pretty_midi.PrettyMIDI()
+    for stem, mp in midi_paths.items():
+        pm = pretty_midi.PrettyMIDI(mp)
+        for inst in pm.instruments:
+            combined.instruments.append(inst)
+    all_path = os.path.join(midi_dir, "all_stems.mid")
+    combined.write(all_path)
+
+    # 8. ZIP bundle
     stage("Packaging…")
-    zip_path = os.path.join(work_dir, f"{track}_midi.zip")
+    zip_path = os.path.join(work_dir, f"{track}_midi_flip.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for stem, p in midi.items():
+        for stem, p in midi_paths.items():
             zf.write(p, arcname=f"{stem}.mid")
+        zf.write(all_path, arcname="all_stems.mid")
+
+    # 9. Report
+    report = [f"# MIDI Flip: {track}", f"BPM: {bpm}", ""]
+    for stem in midi_paths:
+        v = verifications[stem]
+        iss = all_issues[stem]
+        report.append(f"## {stem} — score {v['score']} ({v['detail']})")
+        if iss:
+            report.append("Issues: " + "; ".join(iss))
+        report.append("")
+    report_path = os.path.join(work_dir, "flip_report.md")
+    Path(report_path).write_text("\n".join(report))
 
     return {
-        "track": track, "midi": midi, "analysis": analysis,
-        "verification": verification, "report": report_path, "zip": zip_path,
+        "track": track, "bpm": bpm,
+        "midi": midi_paths, "all_stems": all_path,
+        "verification": verifications, "issues": all_issues,
+        "zip": zip_path, "report": report_path,
     }
